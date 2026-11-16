@@ -4,11 +4,13 @@
 
 """Abstraction-layer for OPC UA variables our framework users interacts with."""
 
+import asyncio
+import dataclasses
 import inspect
-from collections.abc import AsyncGenerator, Awaitable, Callable, Iterator
-from datetime import timedelta
+from collections.abc import AsyncGenerator, Awaitable, Callable, Iterator, Mapping
+from datetime import UTC, datetime, timedelta
 from enum import Enum, IntEnum
-from typing import Generic
+from typing import Any, Generic
 
 from asyncua import ua
 from asyncua.common.node import Node
@@ -26,7 +28,12 @@ from opensmi.core.ua_node_util import (
 from typing_extensions import TypeVar, override
 
 from opensmi.server.mixins.notification_mixins import NotificationForwarderMixin
-from opensmi.server.structures import structure_array_write_check, structure_class, structure_write_check
+from opensmi.server.structures import (
+    structure_array_write_check,
+    structure_class,
+    structure_fields,
+    structure_write_check,
+)
 from opensmi.server.ua_dictionary_entry import DictionaryEntry
 from opensmi.server.ua_object import UaObject, UaObjectDefinition
 
@@ -85,10 +92,30 @@ def _validate_enum_type(enum_type: type[Enum]) -> None:
         raise ValueError(msg)
 
 
+def _pascal_case(field_name: str) -> str:
+    """Return the browse name of a dataclass field: ``in_tolerance`` -> ``InTolerance``."""
+    return "".join(part[:1].upper() + part[1:] for part in field_name.split("_"))
+
+
 class UaVariable(NotificationForwarderMixin, UaObject, Generic[_VariableType]):
     """OPC UA Variable for use in `ParameterSet`, `Monitoring`, `FinalResultData`, etc.
 
     Abstracts raw OPC UA/``asyncua`` away and provides a simple, high-level interface.
+
+    **Complex variables.** A variable whose value is a dataclass instance (not a list) holds the whole structure and
+    has one child variable per field (``HasComponent``), recursively for nested dataclasses. A list, also of
+    dataclasses, is one leaf. The browse name of a child is its field name in PascalCase (``in_tolerance`` ->
+    ``InTolerance``), its display name is the field name. Two fields that become one name fail when the nodes are
+    created. Children are reached with `children` or ``variable["Dimensions"]["Length"]`` and inherit ``writable``,
+    ``bypass_lock`` and ``minimum_access_level``. They have no ``write_check_callback`` of their own.
+
+    Parent and children always agree. Each write is checked once, at the parent: a write to the parent runs its
+    `write_check`, a write to a child runs the parent's `write_check` on the merged value, so a
+    ``write_check_callback`` always sees the whole structure. A refused write changes no node. After a passed
+    check, the written node, its ancestors and its descendants get their values in one call with one
+    ``SourceTimestamp``. A ``write_check_callback`` must not write to the same variable. This holds for writes
+    through `write` and for external OPC UA writes; a write that bypasses the access control (for example one
+    to the node of a child with plain asyncua inside the server) leaves them out of step.
     """
 
     _initial_value_type: type[_VariableType]
@@ -114,6 +141,7 @@ class UaVariable(NotificationForwarderMixin, UaObject, Generic[_VariableType]):
         description: str | None = None,
         ua_value_rank: ua.ValueRank | int | None = None,
         ua_data_type: ua.NodeId | int | None = None,
+        display_name: str | None = None,
         **kwargs,
     ) -> None:
         """*Cooperative* constructor for a new variable instance.
@@ -140,6 +168,7 @@ class UaVariable(NotificationForwarderMixin, UaObject, Generic[_VariableType]):
         :param ua_value_rank: (Optional) OPC UA value rank of this variable. **Advanced**
         :param ua_data_type: (Optional) OPC UA data type of the variable. **Advanced**, make sure this type maps to
             the Python type! You could use this for UInt16, etc. instead of default Int64 types
+        :param display_name: (Optional) OPC UA display name of the variable. Defaults to the name.
         """
         super().__init__(minimum_access_level=minimum_access_level, bypass_lock=bypass_lock, name=name, **kwargs)
 
@@ -176,9 +205,19 @@ class UaVariable(NotificationForwarderMixin, UaObject, Generic[_VariableType]):
         self._ua_value_rank: int | None = ua_value_rank
         self._ua_data_type: ua.NodeId | int | None = ua_data_type
         self._variable_type = variable_type
+        self._display_name = display_name
+
+        # complex variables, see class docstring
+        self._children: dict[str, UaVariable[Any]] = {}
+        self._complex_parent: UaVariable[Any] | None = None
+        self._field_name = ""
+        self._tree_lock = asyncio.Lock()
 
     @lifecycle
     async def _init(self) -> AsyncGenerator[None]:
+        await self._write_display_name()
+        await self._create_children()
+
         try:
             await self.write(self._initial_value)
         except ua.uaerrors.UaError as err:
@@ -213,6 +252,111 @@ class UaVariable(NotificationForwarderMixin, UaObject, Generic[_VariableType]):
 
         yield
         # no shutdown
+
+    async def _write_display_name(self) -> None:
+        if self._display_name is not None:
+            await self.ua_node.write_attribute(
+                ua.attribute_ids.AttributeIds.DisplayName,
+                ua.DataValue(ua.Variant(ua.LocalizedText(self._display_name))),
+            )
+
+    async def _create_children(self) -> None:
+        """Create a child variable per field if the value is a dataclass instance."""
+        value = self._initial_value.Value
+        structure = structure_class(value, self._variable_type)
+        if structure is None or isinstance(value, list):
+            return
+        for each in structure_fields(structure):
+            field_value = getattr(value, each.name)
+            if each.variant_type == ua.VariantType.ExtensionObject:  # nested structure, or an array of them
+                arguments: dict[str, Any] = {"initial_value": field_value, "variable_type": each.element}
+                if not each.array:
+                    del arguments["variable_type"]
+            else:
+                arguments = {"initial_value": ua.Variant(field_value, each.variant_type)}
+                if each.array:
+                    arguments["ua_value_rank"] = ua.ValueRank.OneDimension
+            child = UaVariable(
+                name=_pascal_case(each.name),
+                display_name=each.name,
+                writable=self._writable,
+                bypass_lock=self.bypass_lock,
+                minimum_access_level=self.minimum_access_level,
+                description=f"Field {each.name} of {structure.__name__}.",
+                **arguments,
+            )
+            child._complex_parent, child._field_name = self, each.name
+            child.parent = self
+            await child.ua_create_node(self.ua_node)
+            self._children[child.name] = child
+            await child.init()
+
+    @property
+    def children(self) -> Mapping[str, "UaVariable[Any]"]:
+        """The child variables of a complex variable by name, empty for any other variable."""
+        return self._children
+
+    def __getitem__(self, name: str) -> "UaVariable[Any]":
+        """Get a child variable by the given ``name``.
+
+        :raises KeyError: If no child with given name exists.
+        """
+        try:
+            return self._children[name]
+        except KeyError:
+            msg = f"No child named '{name}' contained in {self.path}!"
+            raise KeyError(msg) from None
+
+    @property
+    def tree_lock(self) -> asyncio.Lock:
+        """Lock that is held while a write to a variable of this complex tree is checked and written."""
+        return self._tree_lock if self._complex_parent is None else self._complex_parent.tree_lock
+
+    async def _changes_up(self, value: object) -> list[tuple["UaVariable[Any]", object]]:
+        """Return ``value`` for this variable and the merged value for each ancestor, the root last."""
+        changes: list[tuple[UaVariable[Any], object]] = [(self, value)]
+        node = self
+        while (parent := node._complex_parent) is not None:
+            value = dataclasses.replace(await parent.ua_node.read_value(), **{node._field_name: value})
+            changes.append((parent, value))
+            node = parent
+        return changes
+
+    async def _check_at_root(self, value: object) -> None:
+        """Check a write to a child once, at the root of its complex variable, on the merged value."""
+        if self._complex_parent is not None:
+            root, merged = (await self._changes_up(value))[-1]
+            await root.write_check(merged)  # pyright: ignore[reportArgumentType]
+
+    def _changes_down(self, value: object) -> list[tuple["UaVariable[Any]", object]]:
+        """Return the part of ``value`` for each descendant."""
+        changes: list[tuple[UaVariable[Any], object]] = []
+        for child in self._children.values():
+            part = getattr(value, child._field_name)  # noqa: SLF001
+            changes.append((child, part))
+            changes.extend(child._changes_down(part))  # noqa: SLF001
+        return changes
+
+    async def sync_writes(self, write_value: ua.WriteValue) -> list[ua.WriteValue]:
+        """Return ``write_value`` for this variable and the writes that bring the rest of its tree in step with it.
+
+        All carry one ``SourceTimestamp``. A variable that is not part of a complex variable returns ``write_value``.
+        """
+        if self._complex_parent is None and not self._children:
+            return [write_value]
+        value = write_value.Value.Value.Value
+        timestamp = write_value.Value.SourceTimestamp or datetime.now(UTC)
+        changes = [*await self._changes_up(value), *self._changes_down(value)]
+        write_values = [
+            ua.WriteValue(
+                NodeId=node.ua_node.nodeid,
+                AttributeId=ua.attribute_ids.AttributeIds.Value,
+                Value=ua.DataValue(ua.Variant(part, node._initial_value.VariantType), SourceTimestamp=timestamp),  # noqa: SLF001  # pyright: ignore[reportArgumentType]
+            )
+            for node, part in changes[1:]
+        ]
+        write_value.Value.SourceTimestamp = timestamp
+        return [write_value, *write_values]
 
     async def _has_existing_description(self) -> bool:
         """Whether the OPC UA node already has a real description, e.g. from the node set."""
@@ -441,6 +585,8 @@ class UaVariable(NotificationForwarderMixin, UaObject, Generic[_VariableType]):
                 msg = f"{self.path}: Given value {value} is outside of valid values for {self._initial_value_type}!"
                 raise OutOfRangeError(msg) from err
 
+        await self._check_at_root(value)
+
     async def write(self, value: _VariableType | ua.Variant | None) -> None:
         """Write given ``value`` to this variable.
 
@@ -536,6 +682,7 @@ class UaVariable(NotificationForwarderMixin, UaObject, Generic[_VariableType]):
             description=description or self.description,
             ua_value_rank=self._ua_value_rank,
             ua_data_type=self._ua_data_type,
+            display_name=self._display_name,
         )
 
     @override

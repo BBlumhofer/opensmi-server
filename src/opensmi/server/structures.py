@@ -64,10 +64,12 @@ if TYPE_CHECKING:
     from asyncua.server.server import Server
 
 __all__ = [
+    "StructureField",
     "StructureRegistry",
     "TypeConflictError",
     "structure_array_write_check",
     "structure_class",
+    "structure_fields",
     "structure_write_check",
 ]
 
@@ -113,11 +115,18 @@ class TypeConflictError(ValueError):
     """A type cannot be created because its name is taken by a different definition."""
 
 
-class _Field(NamedTuple):
+class StructureField(NamedTuple):
+    """A field of a structure."""
+
     name: str
     element: type
     """A `_SCALARS` class, or a dataclass for a nested structure."""
     array: bool
+
+    @property
+    def variant_type(self) -> ua.VariantType:
+        """The VariantType of the field, or of its elements: ``ExtensionObject`` for a nested structure."""
+        return _SCALARS.get(self.element, ua.VariantType.ExtensionObject)
 
     def key(self) -> _Key:
         """Return what makes two fields the same: the name, the type by name and whether it is an array."""
@@ -137,15 +146,20 @@ class StructureRegistry:
         """The keys of the fields of each structure created, by namespace index and name."""
 
 
-def _fields(cls: type) -> list[_Field]:
+def _fields(cls: type) -> list[StructureField]:
     if not (isinstance(cls, type) and dataclasses.is_dataclass(cls)):
         msg = f"{cls!r} is not a dataclass"
         raise TypeError(msg)
     hints = typing.get_type_hints(cls)
-    return [_Field(each.name, *_element(cls, each.name, hints[each.name])) for each in dataclasses.fields(cls)]
+    return [StructureField(each.name, *_element(cls, each.name, hints[each.name])) for each in dataclasses.fields(cls)]
 
 
-def _use_ua_annotations(cls: type, fields: list[_Field]) -> None:
+def structure_fields(cls: type) -> list[StructureField]:
+    """Return the fields of a dataclass, with the ``asyncua.ua`` class or the dataclass each one holds."""
+    return _fields(cls)
+
+
+def _use_ua_annotations(cls: type, fields: list[StructureField]) -> None:
     # asyncua encodes by the annotations of the class, and it only knows its own types: float would not encode
     for each in fields:
         cls.__annotations__[each.name] = list[each.element] if each.array else each.element
@@ -187,7 +201,7 @@ def structure_class(value: object, variable_type: object = None) -> type | None:
     return cls if _is_user_dataclass(cls) and not issubclass(cls, Enum) else None
 
 
-def _collect(cls: type, found: dict[str, tuple[type, list[_Field]]]) -> None:
+def _collect(cls: type, found: dict[str, tuple[type, list[StructureField]]]) -> None:
     """Add the structures ``cls`` needs to ``found``, nested ones first and ``cls`` itself last."""
     fields = _fields(cls)
     known = found.get(cls.__name__)
@@ -214,7 +228,7 @@ async def ensure_structure(
 
     This is `Server.ensure_structure`, see there.
     """
-    found: dict[str, tuple[type, list[_Field]]] = {}
+    found: dict[str, tuple[type, list[StructureField]]] = {}
     _collect(cls, found)
     async with registry.lock:
         keys = {name: tuple(each.key() for each in fields) for name, (_, fields) in found.items()}
@@ -259,7 +273,7 @@ def _node_id(name: str, namespace_index: int) -> ua.NodeId:
     return ua.StringNodeId(Identifier=ua.String(name), NamespaceIndex=ua.Int16(namespace_index))
 
 
-async def _create(server: "Server", namespace_index: int, name: str, fields: list[_Field]) -> None:
+async def _create(server: "Server", namespace_index: int, name: str, fields: list[StructureField]) -> None:
     encoding_id = _node_id(name + _ENCODING_SUFFIX, namespace_index)
     definition = ua.StructureDefinition(
         DefaultEncodingId=encoding_id,
@@ -277,7 +291,7 @@ async def _create(server: "Server", namespace_index: int, name: str, fields: lis
     await node.write_data_type_definition(definition)
 
 
-def _ua_field(each: _Field, namespace_index: int) -> ua.StructureField:
+def _ua_field(each: StructureField, namespace_index: int) -> ua.StructureField:
     if each.element in _SCALARS:
         datatype = ua.NodeId(ua.Int32(_SCALARS[each.element].value), ua.Int16(0))
     else:
